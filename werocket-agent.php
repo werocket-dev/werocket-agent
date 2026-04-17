@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance !
- * Version: 2.5.1
+ * Version: 2.6.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -63,8 +63,13 @@ class WeRocket_Agent {
                 'permission_callback' => '__return_true',
                 'args'                => array_merge( $this->get_default_args(), array(
                     'plugin_path' => array(
-                        'required' => true, 
+                        'required' => false,
                         'type' => 'string', 
+                        'sanitize_callback' => 'sanitize_text_field'
+                    ),
+                    'plugin_slug' => array(
+                        'required' => false,
+                        'type' => 'string',
                         'sanitize_callback' => 'sanitize_text_field'
                     ),
                 )),
@@ -191,6 +196,21 @@ class WeRocket_Agent {
         if ( is_wp_error( $auth ) ) return $auth;
 
         $plugin_path = $request->get_param( 'plugin_path' ); // ex: "seo-by-rank-math/rank-math.php"
+        $plugin_slug = $request->get_param( 'plugin_slug' );
+
+        if ( empty( $plugin_path ) && ! empty( $plugin_slug ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            foreach ( get_plugins() as $path => $info ) {
+                if ( strpos( $path, $plugin_slug . '/' ) === 0 ) {
+                    $plugin_path = $path;
+                    break;
+                }
+            }
+        }
+
+        if ( empty( $plugin_path ) ) {
+            return new WP_Error( 'plugin_not_found', "Plugin '$plugin_slug' introuvable.", array( 'status' => 404 ) );
+        }
 
         // Chargement forcé des fichiers d'administration de WordPress
         require_once ABSPATH . 'wp-admin/includes/file.php';
