@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance !
- * Version: 2.6.0
+ * Version: 2.6.2
  * Author: Romain
  * License: GPL v2 or later
  */
