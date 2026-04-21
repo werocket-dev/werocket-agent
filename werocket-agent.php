@@ -344,7 +344,7 @@ register_deactivation_hook( __FILE__, function() {
 require_once __DIR__ . '/lib/plugin-update-checker/plugin-update-checker.php';
 
 $myUpdateChecker = PucFactory::buildUpdateChecker(
-    'https://github.com/Romain-mont/werocket-agent-wp', 
+    'https://github.com/werocket-dev/werocket-agent', 
     __FILE__,                                            
     'werocket-agent'                                     
 );
