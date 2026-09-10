@@ -5,12 +5,14 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance !
- * Version: 2.6.2
+ * Version: 2.6.3
  * Author: Romain
  * License: GPL v2 or later
  */
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+
 
 class WeRocket_Agent {
     
@@ -75,6 +77,18 @@ class WeRocket_Agent {
                 )),
             )
         );
+
+        // 3. NOUVELLE Route pour mettre à jour le core WordPress (Action)
+        register_rest_route(
+            $this->namespace,
+            '/update-core',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_update_core_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => $this->get_default_args(),
+            )
+        );
     }
 
     // Arguments de sécurité par défaut pour toutes nos routes
@@ -99,7 +113,7 @@ class WeRocket_Agent {
         
         if ( ! $this->verify_token( $token ) ) return new WP_Error( 'token_invalid', 'Token invalide', array( 'status' => 403 ) );
         if ( ! $this->verify_timestamp( $timestamp ) ) return new WP_Error( 'timestamp_old', 'Timestamp expiré', array( 'status' => 403 ) );
-        if ( ! $this->verify_signature( $signature, $timestamp ) ) return new WP_Error( 'sig_invalid', 'Signature invalide', array( 'status' => 403 ) );
+        if ( ! $this->verify_signature( $signature, $timestamp, $request->get_route() ) ) return new WP_Error( 'sig_invalid', 'Signature invalide', array( 'status' => 403 ) );
 
         // Réinitialise le compteur sur auth réussie
         $ip_address = $this->get_client_ip();
@@ -155,16 +169,16 @@ class WeRocket_Agent {
         return $diff <= $this->timestamp_tolerance;
     }
 
-    private function verify_signature( $provided_signature, $timestamp ) {
+    private function verify_signature( $provided_signature, $timestamp, $route ) {
         $site_url = get_site_url();
-        $site_url_clean = rtrim($site_url, '/'); 
-        
-        $message1 = $site_url . '|' . $timestamp;
-        $message2 = $site_url_clean . '|' . $timestamp;
-        
+        $site_url_clean = rtrim($site_url, '/');
+
+        $message1 = $site_url . '|' . $timestamp . '|' . $route;
+        $message2 = $site_url_clean . '|' . $timestamp . '|' . $route;
+
         $expected1 = hash_hmac( 'sha256', $message1, $this->security_token );
         $expected2 = hash_hmac( 'sha256', $message2, $this->security_token );
-        
+
         return hash_equals( $expected1, $provided_signature ) || hash_equals( $expected2, $provided_signature );
     }
 
@@ -262,6 +276,51 @@ class WeRocket_Agent {
             'success' => true,
             'message' => 'Mise à jour réussie',
             'plugin'  => $plugin_path
+        ));
+    }
+
+    // 3. NOUVEAU : La mise à jour du core WordPress
+    public function handle_update_core_request( WP_REST_Request $request ) {
+        $auth = $this->authenticate_request( $request );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/misc.php';
+        require_once ABSPATH . 'wp-admin/includes/update.php';
+        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        require_once ABSPATH . 'wp-admin/includes/class-core-upgrader.php';
+        require_once ABSPATH . 'wp-admin/includes/class-automatic-upgrader-skin.php';
+
+        WP_Filesystem();
+
+        // Force la vérification officielle WordPress.org avant de lire les updates
+        wp_version_check( array(), true );
+        $updates = get_core_updates();
+
+        if ( empty( $updates ) || ! isset( $updates[0]->response ) || 'upgrade' !== $updates[0]->response ) {
+            return rest_ensure_response( array(
+                'success' => true,
+                'message' => 'WordPress déjà à jour',
+                'version' => get_bloginfo( 'version' ),
+            ));
+        }
+
+        $skin     = new Automatic_Upgrader_Skin();
+        $upgrader = new Core_Upgrader( $skin );
+        $result   = $upgrader->upgrade( $updates[0] );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_Error( 'core_upgrade_failed', $result->get_error_message(), array( 'status' => 500 ) );
+        }
+
+        if ( false === $result ) {
+            return new WP_Error( 'core_upgrade_failed', 'La mise à jour du core a échoué silencieusement.', array( 'status' => 500 ) );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'message' => 'WordPress mis à jour',
+            'version' => get_bloginfo( 'version' ),
         ));
     }
 
