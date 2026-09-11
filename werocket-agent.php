@@ -4,49 +4,61 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 /**
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
- * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance !
- * Version: 2.6.3
+ * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
+ * Version: 3.0.0
  * Author: Romain
  * License: GPL v2 or later
  */
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-
+// Clé publique de production — n'est PAS un secret : sa fuite ne permet pas de forger une
+// signature, seulement de la vérifier. La clé privée correspondante ne vit que sur le backend.
+define( 'WEROCKET_PUBLIC_KEY_HEX', 'a75d86c991623949b9201d3df9fcce99073982fe76cd24d829032bd78e02cdbc' );
 
 class WeRocket_Agent {
-    
-    private $security_token;
+
+    private $public_key;
     private $header_key;
     private $namespace = 'werocket/v1';
     private $max_attempts = 5;
     private $time_window = 3600;
     private $timestamp_tolerance = 300;
-    
+
     public function __construct() {
-        // Vérification TOKEN
-        if ( ! defined( 'WEROCKET_AGENT_TOKEN' ) || empty( WEROCKET_AGENT_TOKEN ) ) {
+        if ( ! defined( 'WEROCKET_PUBLIC_KEY_HEX' ) || empty( WEROCKET_PUBLIC_KEY_HEX ) ) {
             if ( is_admin() ) {
                 add_action( 'admin_notices', array( $this, 'admin_notice' ) );
             }
             return;
         }
-        
-        $this->security_token = WEROCKET_AGENT_TOKEN;
-        $this->header_key = defined('WEROCKET_AGENT_HEADER_KEY') ? WEROCKET_AGENT_HEADER_KEY : '';
+
+        if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+            if ( is_admin() ) {
+                add_action( 'admin_notices', array( $this, 'admin_notice_sodium' ) );
+            }
+            return;
+        }
+
+        $this->public_key = hex2bin( WEROCKET_PUBLIC_KEY_HEX );
+        $this->header_key = defined( 'WEROCKET_AGENT_HEADER_KEY' ) ? WEROCKET_AGENT_HEADER_KEY : '';
 
         add_action( 'rest_api_init', array( $this, 'register_api_routes' ) );
     }
-    
+
     public function admin_notice() {
-        echo '<div class="notice notice-error"><p><strong>WeRocket Agent:</strong> Ajoutez <code>define(\'WEROCKET_AGENT_TOKEN\', \'...\');</code> dans wp-config.php</p></div>';
+        echo '<div class="notice notice-error"><p><strong>WeRocket Agent:</strong> Clé publique manquante (WEROCKET_PUBLIC_KEY_HEX).</p></div>';
     }
-    
+
+    public function admin_notice_sodium() {
+        echo '<div class="notice notice-error"><p><strong>WeRocket Agent:</strong> Extension PHP <code>sodium</code> manquante (PHP ≥ 7.2 requis).</p></div>';
+    }
+
     public function register_api_routes() {
         // 1. Route pour le statut (Lecture)
-        register_rest_route( 
-            $this->namespace, 
-            '/status', 
+        register_rest_route(
+            $this->namespace,
+            '/status',
             array(
                 'methods'             => 'POST',
                 'callback'            => array( $this, 'handle_status_request' ),
@@ -55,10 +67,10 @@ class WeRocket_Agent {
             )
         );
 
-        // 2. NOUVELLE Route pour mettre à jour un plugin précis (Action)
-        register_rest_route( 
-            $this->namespace, 
-            '/update-plugin', 
+        // 2. Route pour mettre à jour un plugin précis (Action)
+        register_rest_route(
+            $this->namespace,
+            '/update-plugin',
             array(
                 'methods'             => 'POST',
                 'callback'            => array( $this, 'handle_update_plugin_request' ),
@@ -66,7 +78,7 @@ class WeRocket_Agent {
                 'args'                => array_merge( $this->get_default_args(), array(
                     'plugin_path' => array(
                         'required' => false,
-                        'type' => 'string', 
+                        'type' => 'string',
                         'sanitize_callback' => 'sanitize_text_field'
                     ),
                     'plugin_slug' => array(
@@ -78,7 +90,7 @@ class WeRocket_Agent {
             )
         );
 
-        // 3. NOUVELLE Route pour mettre à jour le core WordPress (Action)
+        // 3. Route pour mettre à jour le core WordPress (Action)
         register_rest_route(
             $this->namespace,
             '/update-core',
@@ -89,33 +101,51 @@ class WeRocket_Agent {
                 'args'                => $this->get_default_args(),
             )
         );
+
+        // 4. Configuration de la liste blanche d'IP autorisées à appeler l'API
+        register_rest_route(
+            $this->namespace,
+            '/set-allowed-ips',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_set_allowed_ips_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => array_merge( $this->get_default_args(), array(
+                    'ips' => array(
+                        'required'          => true,
+                        'type'              => 'string', // Liste d'IP séparées par des virgules
+                        'sanitize_callback' => 'sanitize_text_field',
+                    ),
+                )),
+            )
+        );
     }
 
-    // Arguments de sécurité par défaut pour toutes nos routes
+    // Plus de paramètre "token" : la signature Ed25519 est la seule preuve d'identité nécessaire.
     private function get_default_args() {
         return array(
-            'token'     => array('required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field'),
-            'timestamp' => array('required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint'),
-            'signature' => array('required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field'),
+            'timestamp' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            'signature' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
         );
     }
 
     // --- SÉCURITÉ CENTRALISÉE ---
 
-    // Cette fonction vérifie tout. Si c'est bon elle retourne true, sinon une erreur WP_Error.
+    // IP allowlist appliquée à TOUTES les routes (pas seulement les routes sensibles).
     private function authenticate_request( WP_REST_Request $request ) {
+        if ( ! $this->verify_ip_allowlist() ) {
+            $this->log_event( 'ip_not_allowed', $this->get_client_ip() );
+            return new WP_Error( 'ip_not_allowed', 'IP non autorisée pour cette route', array( 'status' => 403 ) );
+        }
         if ( ! $this->check_rate_limit() ) return new WP_Error( 'rate_limit', 'Trop de requêtes', array( 'status' => 429 ) );
         if ( ! $this->verify_header() ) return new WP_Error( 'header_invalid', 'Header invalide', array( 'status' => 403 ) );
-        
-        $token = $request->get_param( 'token' );
+
         $timestamp = $request->get_param( 'timestamp' );
         $signature = $request->get_param( 'signature' );
-        
-        if ( ! $this->verify_token( $token ) ) return new WP_Error( 'token_invalid', 'Token invalide', array( 'status' => 403 ) );
+
         if ( ! $this->verify_timestamp( $timestamp ) ) return new WP_Error( 'timestamp_old', 'Timestamp expiré', array( 'status' => 403 ) );
         if ( ! $this->verify_signature( $signature, $timestamp, $request->get_route() ) ) return new WP_Error( 'sig_invalid', 'Signature invalide', array( 'status' => 403 ) );
 
-        // Réinitialise le compteur sur auth réussie
         $ip_address = $this->get_client_ip();
         delete_transient( 'werocket_rate_limit_' . md5( $ip_address ) );
         $this->log_event( 'access_granted', $ip_address );
@@ -127,26 +157,62 @@ class WeRocket_Agent {
         $transient_key = 'werocket_rate_limit_' . md5( $ip_address );
         $attempts = get_transient( $transient_key );
         if ( false === $attempts ) { $attempts = 0; }
-        
+
         if ( $attempts >= $this->max_attempts ) {
             $this->log_event( 'rate_limit', $ip_address );
             return false;
         }
-        
+
         set_transient( $transient_key, $attempts + 1, $this->time_window );
         return true;
     }
 
+    // L'IP de connexion réelle (REMOTE_ADDR) ne peut pas être falsifiée par le client, contrairement
+    // aux headers X-Forwarded-For / X-Real-IP / CF-Connecting-IP qu'il envoie lui-même. On ne fait
+    // confiance à ces headers que si la requête vient d'un proxy explicitement déclaré de confiance
+    // (WEROCKET_TRUSTED_PROXIES dans wp-config), sinon on s'appuie uniquement sur REMOTE_ADDR.
     private function get_client_ip() {
-        $ip_keys = array('HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR');
-        foreach ( $ip_keys as $key ) {
-            if ( array_key_exists( $key, $_SERVER ) ) {
-                $ip = explode( ',', $_SERVER[ $key ] );
-                $ip = trim( $ip[0] );
-                if ( filter_var( $ip, FILTER_VALIDATE_IP ) ) return $ip;
+        $remote_addr = ( isset( $_SERVER['REMOTE_ADDR'] ) && filter_var( $_SERVER['REMOTE_ADDR'], FILTER_VALIDATE_IP ) )
+            ? $_SERVER['REMOTE_ADDR']
+            : '0.0.0.0';
+
+        if ( $this->is_trusted_proxy( $remote_addr ) ) {
+            if ( isset( $_SERVER['HTTP_CF_CONNECTING_IP'] ) && filter_var( trim( $_SERVER['HTTP_CF_CONNECTING_IP'] ), FILTER_VALIDATE_IP ) ) {
+                return trim( $_SERVER['HTTP_CF_CONNECTING_IP'] );
+            }
+            if ( isset( $_SERVER['HTTP_X_REAL_IP'] ) && filter_var( trim( $_SERVER['HTTP_X_REAL_IP'] ), FILTER_VALIDATE_IP ) ) {
+                return trim( $_SERVER['HTTP_X_REAL_IP'] );
+            }
+            if ( isset( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
+                $chain = array_map( 'trim', explode( ',', $_SERVER['HTTP_X_FORWARDED_FOR'] ) );
+                $last = end( $chain );
+                if ( filter_var( $last, FILTER_VALIDATE_IP ) ) return $last;
             }
         }
-        return '0.0.0.0';
+
+        return $remote_addr;
+    }
+
+    private function is_trusted_proxy( $remote_addr ) {
+        if ( ! defined( 'WEROCKET_TRUSTED_PROXIES' ) || empty( WEROCKET_TRUSTED_PROXIES ) ) return false;
+        $trusted = array_filter( array_map( 'trim', explode( ',', WEROCKET_TRUSTED_PROXIES ) ) );
+        return in_array( $remote_addr, $trusted, true );
+    }
+
+    // Liste blanche d'IP autorisées à appeler l'API. Configurable à distance via /set-allowed-ips
+    // (stockée en wp_options), avec WEROCKET_ALLOWED_IPS (wp-config) comme repli.
+    // Vide des deux côtés = pas de restriction (bootstrap avant première configuration).
+    private function get_allowed_ips() {
+        $stored = get_option( 'werocket_allowed_ips', '' );
+        $raw = ! empty( $stored ) ? $stored : ( defined( 'WEROCKET_ALLOWED_IPS' ) ? WEROCKET_ALLOWED_IPS : '' );
+        if ( empty( $raw ) ) return array();
+        return array_filter( array_map( 'trim', explode( ',', $raw ) ) );
+    }
+
+    private function verify_ip_allowlist() {
+        $allowed = $this->get_allowed_ips();
+        if ( empty( $allowed ) ) return true; // Pas encore configurée : pas de restriction.
+        return in_array( $this->get_client_ip(), $allowed, true );
     }
 
     private function verify_header() {
@@ -159,27 +225,29 @@ class WeRocket_Agent {
         return $valid;
     }
 
-    private function verify_token( $token ) {
-        return hash_equals( $this->security_token, $token );
-    }
-
     private function verify_timestamp( $timestamp ) {
         if ( empty( $timestamp ) || ! is_numeric( $timestamp ) ) return false;
         $diff = abs( time() - $timestamp );
         return $diff <= $this->timestamp_tolerance;
     }
 
-    private function verify_signature( $provided_signature, $timestamp, $route ) {
+    // Vérifie une signature Ed25519 détachée avec la clé PUBLIQUE (la clé privée ne quitte
+    // jamais le backend). Message signé : "site_url|timestamp|route" (deux variantes testées
+    // pour tolérer la présence/absence du slash final sur l'URL du site).
+    private function verify_signature( $provided_signature_hex, $timestamp, $route ) {
+        if ( ! ctype_xdigit( $provided_signature_hex ) || strlen( $provided_signature_hex ) !== 128 ) {
+            return false; // signature détachée Ed25519 = 64 octets = 128 caractères hex
+        }
+        $signature = hex2bin( $provided_signature_hex );
+
         $site_url = get_site_url();
-        $site_url_clean = rtrim($site_url, '/');
+        $site_url_clean = rtrim( $site_url, '/' );
 
         $message1 = $site_url . '|' . $timestamp . '|' . $route;
         $message2 = $site_url_clean . '|' . $timestamp . '|' . $route;
 
-        $expected1 = hash_hmac( 'sha256', $message1, $this->security_token );
-        $expected2 = hash_hmac( 'sha256', $message2, $this->security_token );
-
-        return hash_equals( $expected1, $provided_signature ) || hash_equals( $expected2, $provided_signature );
+        return sodium_crypto_sign_verify_detached( $signature, $message1, $this->public_key )
+            || sodium_crypto_sign_verify_detached( $signature, $message2, $this->public_key );
     }
 
     private function log_event( $type, $ip ) {
@@ -204,7 +272,7 @@ class WeRocket_Agent {
         ));
     }
 
-    // 2. NOUVEAU : La mise à jour à distance
+    // 2. La mise à jour d'un plugin à distance
     public function handle_update_plugin_request( WP_REST_Request $request ) {
         $auth = $this->authenticate_request( $request );
         if ( is_wp_error( $auth ) ) return $auth;
@@ -279,7 +347,7 @@ class WeRocket_Agent {
         ));
     }
 
-    // 3. NOUVEAU : La mise à jour du core WordPress
+    // 3. La mise à jour du core WordPress
     public function handle_update_core_request( WP_REST_Request $request ) {
         $auth = $this->authenticate_request( $request );
         if ( is_wp_error( $auth ) ) return $auth;
@@ -324,6 +392,30 @@ class WeRocket_Agent {
         ));
     }
 
+    // 4. Configuration de la liste blanche d'IP
+    public function handle_set_allowed_ips_request( WP_REST_Request $request ) {
+        $auth = $this->authenticate_request( $request );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        $ips_raw = $request->get_param( 'ips' );
+        $ips = array_filter( array_map( 'trim', explode( ',', $ips_raw ) ) );
+
+        foreach ( $ips as $ip ) {
+            if ( ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+                return new WP_Error( 'ip_invalid', sprintf( "L'adresse IP '%s' est invalide.", $ip ), array( 'status' => 400 ) );
+            }
+        }
+
+        update_option( 'werocket_allowed_ips', implode( ',', $ips ) );
+        $this->log_event( 'allowed_ips_updated', $this->get_client_ip() );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'message' => 'Liste blanche IP mise à jour',
+            'ips'     => array_values( $ips ),
+        ));
+    }
+
     // --- DATA GETTERS ---
 
     private function get_versions_info() {
@@ -336,11 +428,11 @@ class WeRocket_Agent {
         $all_plugins = get_plugins();
         $active_plugins = get_option( 'active_plugins', array() );
         $data = array();
-        
+
         foreach ( $all_plugins as $path => $info ) {
             $plugin_slug = dirname( $path );
             if ( '.' === $plugin_slug ) { $plugin_slug = basename( $path, '.php' ); }
-            
+
             $data[] = array(
                 'name' => $info['Name'],
                 'version' => $info['Version'],
@@ -364,8 +456,8 @@ class WeRocket_Agent {
 
     private function get_theme_info() {
         $theme = wp_get_theme();
-        return array( 
-            'name' => $theme->get('Name'), 
+        return array(
+            'name' => $theme->get('Name'),
             'version' => $theme->get('Version'),
             'author' => $theme->get('Author')
         );
@@ -403,9 +495,9 @@ register_deactivation_hook( __FILE__, function() {
 require_once __DIR__ . '/lib/plugin-update-checker/plugin-update-checker.php';
 
 $myUpdateChecker = PucFactory::buildUpdateChecker(
-    'https://github.com/werocket-dev/werocket-agent', 
-    __FILE__,                                            
-    'werocket-agent'                                     
+    'https://github.com/werocket-dev/werocket-agent',
+    __FILE__,
+    'werocket-agent'
 );
 
 if ( defined( 'WEROCKET_GITHUB_TOKEN' ) && ! empty( WEROCKET_GITHUB_TOKEN ) ) {
@@ -415,7 +507,7 @@ if ( defined( 'WEROCKET_GITHUB_TOKEN' ) && ! empty( WEROCKET_GITHUB_TOKEN ) ) {
 $myUpdateChecker->getVcsApi()->enableReleaseAssets();
 
 if ( defined( 'WEROCKET_BETA_TESTER' ) && WEROCKET_BETA_TESTER ) {
-    $myUpdateChecker->setBranch( 'main' ); 
+    $myUpdateChecker->setBranch( 'main' );
 }
 
 add_filter( 'auto_update_plugin', function ( $update, $item ) {
