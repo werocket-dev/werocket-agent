@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.0.1
+ * Version: 3.1.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -277,6 +277,7 @@ class WeRocket_Agent {
             'plugins'   => $this->get_plugins_info(),
             'theme'     => $this->get_theme_info(),
             'server'    => $this->get_server_info(),
+            'licenses'  => $this->get_license_info(),
         ));
     }
 
@@ -478,6 +479,39 @@ class WeRocket_Agent {
             'wp_memory' => WP_MEMORY_LIMIT,
             'upload_max' => ini_get( 'upload_max_filesize' ),
             'post_max' => ini_get( 'post_max_size' )
+        );
+    }
+
+    // Statut des licences de plugins premium connus. On ne renvoie JAMAIS la clé de
+    // licence brute ni les infos client (email, etc.) — seulement le strict nécessaire
+    // pour savoir si la licence est valide et quand elle expire.
+    // Extensible : ajouter une entrée par plugin premium à surveiller.
+    private function get_license_info() {
+        $licenses = array();
+
+        $breakdance = $this->get_breakdance_license_status();
+        if ( null !== $breakdance ) {
+            $licenses['breakdance'] = $breakdance;
+        }
+
+        return $licenses;
+    }
+
+    // Breakdance stocke sa licence via le système EDD (Easy Digital Downloads) Software
+    // Licensing dans l'option 'breakdance_license_key_validity_info', en JSON stringifié.
+    private function get_breakdance_license_status() {
+        $raw = get_option( 'breakdance_license_key_validity_info' );
+        if ( empty( $raw ) ) return null;
+
+        $decoded = is_string( $raw ) ? json_decode( $raw, true ) : $raw;
+        if ( ! is_array( $decoded ) || empty( $decoded['edd_key_info'] ) ) return null;
+
+        $edd = $decoded['edd_key_info'];
+
+        return array(
+            'valid'   => ( ( $edd['license'] ?? '' ) === 'valid' ),
+            'item'    => $edd['item_name'] ?? null,
+            'expires' => $edd['expires'] ?? null,
         );
     }
 }
