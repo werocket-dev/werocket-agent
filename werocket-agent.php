@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.0.0
+ * Version: 3.0.1
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -260,6 +260,14 @@ class WeRocket_Agent {
     public function handle_status_request( WP_REST_Request $request ) {
         $auth = $this->authenticate_request( $request );
         if ( is_wp_error( $auth ) ) return $auth;
+
+        // Force le recalcul du cache de mises à jour AVANT de le lire — sinon
+        // get_site_transient('update_plugins') peut être vide/obsolète (vidé après
+        // chaque upgrade, et sinon dépendant du cron WP qui peut être désactivé).
+        if ( ! function_exists( 'wp_update_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/update.php';
+        }
+        wp_update_plugins();
 
         return rest_ensure_response( array(
             'success'   => true,
