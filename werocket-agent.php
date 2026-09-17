@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.1.0
+ * Version: 3.1.1
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -499,20 +499,38 @@ class WeRocket_Agent {
 
     // Breakdance stocke sa licence via le système EDD (Easy Digital Downloads) Software
     // Licensing dans l'option 'breakdance_license_key_validity_info', en JSON stringifié.
+    // Cette option disparaît entièrement quand la licence est désactivée (pas juste modifiée) —
+    // on ne renvoie donc PAS null dans ce cas : Breakdance est présent, mais sans info exploitable,
+    // ce qui doit être signalé ("a_verifier") plutôt que de disparaître silencieusement du rapport.
     private function get_breakdance_license_status() {
+        if ( ! $this->is_breakdance_active() ) return null; // Breakdance absent : rien à signaler
+
         $raw = get_option( 'breakdance_license_key_validity_info' );
-        if ( empty( $raw ) ) return null;
+        $decoded = ( is_string( $raw ) && ! empty( $raw ) ) ? json_decode( $raw, true ) : null;
+        $edd = is_array( $decoded ) ? ( $decoded['edd_key_info'] ?? null ) : null;
 
-        $decoded = is_string( $raw ) ? json_decode( $raw, true ) : $raw;
-        if ( ! is_array( $decoded ) || empty( $decoded['edd_key_info'] ) ) return null;
-
-        $edd = $decoded['edd_key_info'];
+        if ( empty( $edd ) ) {
+            return array(
+                'status'  => 'a_verifier',
+                'valid'   => null,
+                'item'    => null,
+                'expires' => null,
+            );
+        }
 
         return array(
+            'status'  => ( ( $edd['license'] ?? '' ) === 'valid' ) ? 'ok' : 'invalide',
             'valid'   => ( ( $edd['license'] ?? '' ) === 'valid' ),
             'item'    => $edd['item_name'] ?? null,
             'expires' => $edd['expires'] ?? null,
         );
+    }
+
+    private function is_breakdance_active() {
+        if ( ! function_exists( 'is_plugin_active' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        return is_plugin_active( 'breakdance/plugin.php' );
     }
 }
 
