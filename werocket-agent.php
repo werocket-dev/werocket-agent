@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.1.1
+ * Version: 3.2.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -114,6 +114,24 @@ class WeRocket_Agent {
                     'ips' => array(
                         'required'          => true,
                         'type'              => 'string', // Liste d'IP séparées par des virgules
+                        'sanitize_callback' => 'sanitize_text_field',
+                    ),
+                )),
+            )
+        );
+
+        // 5. Suppression d'un thème inutilisé (Action)
+        register_rest_route(
+            $this->namespace,
+            '/delete-theme',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_delete_theme_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => array_merge( $this->get_default_args(), array(
+                    'theme_slug' => array(
+                        'required'          => true,
+                        'type'              => 'string',
                         'sanitize_callback' => 'sanitize_text_field',
                     ),
                 )),
@@ -276,6 +294,7 @@ class WeRocket_Agent {
             'versions'  => $this->get_versions_info(),
             'plugins'   => $this->get_plugins_info(),
             'theme'     => $this->get_theme_info(),
+            'themes'    => $this->get_all_themes_info(),
             'server'    => $this->get_server_info(),
             'licenses'  => $this->get_license_info(),
         ));
@@ -425,6 +444,51 @@ class WeRocket_Agent {
         ));
     }
 
+    // 5. Suppression d'un thème inutilisé
+    public function handle_delete_theme_request( WP_REST_Request $request ) {
+        $auth = $this->authenticate_request( $request );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        $theme_slug = $request->get_param( 'theme_slug' );
+
+        // Validation stricte du format : pas de traversal de répertoire
+        if ( ! preg_match( '#^[a-zA-Z0-9_\-]+$#', $theme_slug ) ) {
+            return new WP_Error( 'theme_slug_invalid', 'Nom de thème invalide.', array( 'status' => 400 ) );
+        }
+
+        if ( $theme_slug === get_stylesheet() ) {
+            return new WP_Error( 'theme_active', 'Impossible de supprimer le thème actuellement actif.', array( 'status' => 400 ) );
+        }
+
+        $active_template = wp_get_theme()->get( 'Template' );
+        if ( ! empty( $active_template ) && $theme_slug === $active_template ) {
+            return new WP_Error( 'theme_parent_active', 'Ce thème est le parent du thème actif — suppression refusée.', array( 'status' => 400 ) );
+        }
+
+        if ( ! wp_get_theme( $theme_slug )->exists() ) {
+            return new WP_Error( 'theme_not_found', 'Le thème spécifié est introuvable.', array( 'status' => 404 ) );
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/theme.php';
+
+        WP_Filesystem();
+
+        $result = delete_theme( $theme_slug );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_Error( 'delete_failed', $result->get_error_message(), array( 'status' => 500 ) );
+        }
+
+        $this->log_event( 'theme_deleted:' . $theme_slug, $this->get_client_ip() );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'message' => 'Thème supprimé',
+            'theme'   => $theme_slug,
+        ));
+    }
+
     // --- DATA GETTERS ---
 
     private function get_versions_info() {
@@ -470,6 +534,29 @@ class WeRocket_Agent {
             'version' => $theme->get('Version'),
             'author' => $theme->get('Author')
         );
+    }
+
+    // Tous les thèmes installés (pas seulement l'actif) — pour repérer les thèmes par défaut
+    // ajoutés automatiquement par WordPress à chaque mise à jour du core, à nettoyer si inutiles.
+    private function get_all_themes_info() {
+        $all_themes = wp_get_themes();
+        $active_stylesheet = get_stylesheet();
+        $active_theme = wp_get_theme();
+        $active_template = $active_theme->get( 'Template' ); // thème parent utilisé par l'actif, si enfant
+
+        $data = array();
+        foreach ( $all_themes as $slug => $theme ) {
+            $data[] = array(
+                'slug'       => $slug,
+                'name'       => $theme->get( 'Name' ),
+                'version'    => $theme->get( 'Version' ),
+                'author'     => $theme->get( 'Author' ),
+                'is_active'  => ( $slug === $active_stylesheet ),
+                // Empêche la suppression accidentelle d'un thème parent encore utilisé par l'actif.
+                'is_parent_of_active' => ( ! empty( $active_template ) && $slug === $active_template ),
+            );
+        }
+        return $data;
     }
 
     private function get_server_info() {
