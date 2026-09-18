@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.2.1
+ * Version: 3.2.2
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -282,6 +282,13 @@ class WeRocket_Agent {
         // Force le recalcul du cache de mises à jour AVANT de le lire — sinon
         // get_site_transient('update_plugins') peut être vide/obsolète (vidé après
         // chaque upgrade, et sinon dépendant du cron WP qui peut être désactivé).
+        // On supprime le transient d'abord (comme le lien "Vérifier à nouveau" de
+        // l'admin WP) : wp_update_plugins() seul ne revérifie QUE les plugins
+        // hébergés sur WordPress.org (les plugins avec un header "Update URI:"
+        // personnalisé, ex. Headspin, en sont exclus depuis WP 5.8) — sans ce
+        // delete, leur propre checker (accroché au filtre site_transient_update_plugins)
+        // ne se redéclenche pas forcément à cet instant précis.
+        delete_site_transient( 'update_plugins' );
         if ( ! function_exists( 'wp_update_plugins' ) ) {
             require_once ABSPATH . 'wp-admin/includes/update.php';
         }
@@ -348,7 +355,11 @@ class WeRocket_Agent {
         // Force le recalcul du cache de mises à jour AVANT de lancer l'upgrade — sinon
         // Plugin_Upgrader::upgrade() peut ne rien trouver dans un cache périmé/vide et
         // renvoyer null ("déjà à jour") sans jamais avoir réellement téléchargé la nouvelle
-        // version. Même correctif que celui déjà appliqué à handle_status_request().
+        // version. Le delete_site_transient() est nécessaire en plus de wp_update_plugins() :
+        // ce dernier ne revérifie que les plugins hébergés sur WordPress.org — les plugins à
+        // updater personnalisé (header "Update URI:", ex. Headspin) en sont exclus depuis WP
+        // 5.8, donc sans supprimer le transient d'abord, leur propre checker ne se relance pas.
+        delete_site_transient( 'update_plugins' );
         if ( ! function_exists( 'wp_update_plugins' ) ) {
             require_once ABSPATH . 'wp-admin/includes/update.php';
         }
