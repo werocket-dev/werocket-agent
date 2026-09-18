@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.2.0
+ * Version: 3.2.1
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -344,6 +344,15 @@ class WeRocket_Agent {
 
         // On vérifie s'il était actif avant la mise à jour
         $was_active = is_plugin_active( $plugin_path );
+
+        // Force le recalcul du cache de mises à jour AVANT de lancer l'upgrade — sinon
+        // Plugin_Upgrader::upgrade() peut ne rien trouver dans un cache périmé/vide et
+        // renvoyer null ("déjà à jour") sans jamais avoir réellement téléchargé la nouvelle
+        // version. Même correctif que celui déjà appliqué à handle_status_request().
+        if ( ! function_exists( 'wp_update_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/update.php';
+        }
+        wp_update_plugins();
 
         // Lancement de la mise à jour silencieuse
         $skin     = new Automatic_Upgrader_Skin();
