@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.3.0
+ * Version: 3.3.1
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -677,25 +677,51 @@ class WeRocket_Agent {
     private function get_breakdance_license_status() {
         if ( ! $this->is_breakdance_active() ) return null; // Breakdance absent : rien à signaler
 
+        $plugin_version = $this->get_breakdance_plugin_version();
+
         $raw = get_option( 'breakdance_license_key_validity_info' );
         $decoded = ( is_string( $raw ) && ! empty( $raw ) ) ? json_decode( $raw, true ) : null;
         $edd = is_array( $decoded ) ? ( $decoded['edd_key_info'] ?? null ) : null;
 
         if ( empty( $edd ) ) {
             return array(
-                'status'  => 'a_verifier',
-                'valid'   => null,
-                'item'    => null,
-                'expires' => null,
+                'status'         => 'a_verifier',
+                'valid'          => null,
+                'item'           => null,
+                'expires'        => null,
+                'plugin_version' => $plugin_version,
             );
         }
 
+        // Même tolérance que Breakdance applique lui-même (LicenseKeyManager::
+        // isLicenseValidityStatusEligibleForProMode) : une licence "expired" reste
+        // considérée fonctionnelle si elle a déjà été payée une fois — sinon on
+        // remonterait une fausse alerte "invalide" pour un site qui marche très bien.
+        $license = $edd['license'] ?? '';
+        $is_ok = ( 'valid' === $license )
+            || ( 'expired' === $license && ! empty( $edd['has_license_been_paid_for'] ) );
+
         return array(
-            'status'  => ( ( $edd['license'] ?? '' ) === 'valid' ) ? 'ok' : 'invalide',
-            'valid'   => ( ( $edd['license'] ?? '' ) === 'valid' ),
-            'item'    => $edd['item_name'] ?? null,
-            'expires' => $edd['expires'] ?? null,
+            'status'         => $is_ok ? 'ok' : 'invalide',
+            'valid'          => $is_ok,
+            'item'           => $edd['item_name'] ?? null,
+            'expires'        => $edd['expires'] ?? null,
+            'plugin_version' => $plugin_version,
         );
+    }
+
+    // Version du plugin Breakdance lui-même — utile pour repérer les installs GPL/piratées,
+    // qui restent typiquement bloquées sur une vieille version (leur système de mise à jour
+    // dépend souvent du même mécanisme de licence, patché et donc non fonctionnel).
+    private function get_breakdance_plugin_version() {
+        if ( ! function_exists( 'get_plugin_data' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        $path = WP_PLUGIN_DIR . '/breakdance/plugin.php';
+        if ( ! file_exists( $path ) ) return null;
+
+        $data = get_plugin_data( $path, false, false );
+        return $data['Version'] ?? null;
     }
 
     private function is_breakdance_active() {
