@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.2.2
+ * Version: 3.3.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -130,6 +130,24 @@ class WeRocket_Agent {
                 'permission_callback' => '__return_true',
                 'args'                => array_merge( $this->get_default_args(), array(
                     'theme_slug' => array(
+                        'required'          => true,
+                        'type'              => 'string',
+                        'sanitize_callback' => 'sanitize_text_field',
+                    ),
+                )),
+            )
+        );
+
+        // 6. Activation/revalidation d'une licence Breakdance (Action)
+        register_rest_route(
+            $this->namespace,
+            '/activate-license',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_activate_license_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => array_merge( $this->get_default_args(), array(
+                    'license_key' => array(
                         'required'          => true,
                         'type'              => 'string',
                         'sanitize_callback' => 'sanitize_text_field',
@@ -506,6 +524,53 @@ class WeRocket_Agent {
             'success' => true,
             'message' => 'Thème supprimé',
             'theme'   => $theme_slug,
+        ));
+    }
+
+    // 6. Activation/revalidation d'une licence Breakdance
+    // Appelle directement Breakdance\...\LicenseKeyManager::changeLicenseKey(), la même
+    // méthode publique utilisée par leur propre commande WP-CLI (`wp breakdance license`).
+    // Le namespace exact n'étant pas garanti stable entre versions de Breakdance, on
+    // recherche la classe par son nom court plutôt que de le coder en dur.
+    public function handle_activate_license_request( WP_REST_Request $request ) {
+        $auth = $this->authenticate_request( $request );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        if ( ! $this->is_breakdance_active() ) {
+            return new WP_Error( 'breakdance_not_active', 'Breakdance n\'est pas actif sur ce site.', array( 'status' => 404 ) );
+        }
+
+        $license_key = $request->get_param( 'license_key' );
+        if ( empty( trim( $license_key ) ) ) {
+            return new WP_Error( 'license_key_empty', 'Clé de licence vide.', array( 'status' => 400 ) );
+        }
+
+        $manager_class = null;
+        foreach ( get_declared_classes() as $class ) {
+            if ( substr( $class, -strlen( 'LicenseKeyManager' ) ) === 'LicenseKeyManager' ) {
+                $manager_class = $class;
+                break;
+            }
+        }
+
+        if ( ! $manager_class || ! method_exists( $manager_class, 'getInstance' ) ) {
+            return new WP_Error( 'breakdance_api_unavailable', 'LicenseKeyManager introuvable (API interne de Breakdance modifiée ou plugin absent).', array( 'status' => 500 ) );
+        }
+
+        $manager = $manager_class::getInstance();
+
+        if ( ! method_exists( $manager, 'changeLicenseKey' ) ) {
+            return new WP_Error( 'breakdance_api_unavailable', 'Méthode changeLicenseKey() introuvable sur LicenseKeyManager.', array( 'status' => 500 ) );
+        }
+
+        $manager->changeLicenseKey( $license_key );
+
+        $this->log_event( 'breakdance_license_activated', $this->get_client_ip() );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'message' => 'Licence Breakdance revalidée',
+            'license' => $this->get_breakdance_license_status(),
         ));
     }
 
