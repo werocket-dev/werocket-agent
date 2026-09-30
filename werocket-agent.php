@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.4.0
+ * Version: 3.5.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -165,10 +165,11 @@ class WeRocket_Agent {
                 'callback'            => array( $this, 'handle_install_plugin_zip_request' ),
                 'permission_callback' => '__return_true',
                 'args'                => array_merge( $this->get_default_args(), array(
+                    // Pas de sanitize_callback : la valeur est signée telle quelle par le backend,
+                    // la modifier (esc_url_raw) casserait la vérification de signature.
                     'zip_url' => array(
-                        'required'          => true,
-                        'type'              => 'string',
-                        'sanitize_callback' => 'esc_url_raw',
+                        'required' => true,
+                        'type'     => 'string',
                     ),
                     'sha256' => array(
                         'required'          => true,
@@ -191,7 +192,8 @@ class WeRocket_Agent {
     // --- SÉCURITÉ CENTRALISÉE ---
 
     // IP allowlist appliquée à TOUTES les routes (pas seulement les routes sensibles).
-    private function authenticate_request( WP_REST_Request $request ) {
+    // $signed_extra : paramètres supplémentaires inclus dans le message signé (routes sensibles).
+    private function authenticate_request( WP_REST_Request $request, $signed_extra = '' ) {
         if ( ! $this->verify_ip_allowlist() ) {
             $this->log_event( 'ip_not_allowed', $this->get_client_ip() );
             return new WP_Error( 'ip_not_allowed', 'IP non autorisée pour cette route', array( 'status' => 403 ) );
@@ -203,7 +205,7 @@ class WeRocket_Agent {
         $signature = $request->get_param( 'signature' );
 
         if ( ! $this->verify_timestamp( $timestamp ) ) return new WP_Error( 'timestamp_old', 'Timestamp expiré', array( 'status' => 403 ) );
-        if ( ! $this->verify_signature( $signature, $timestamp, $request->get_route() ) ) return new WP_Error( 'sig_invalid', 'Signature invalide', array( 'status' => 403 ) );
+        if ( ! $this->verify_signature( $signature, $timestamp, $request->get_route(), $signed_extra ) ) return new WP_Error( 'sig_invalid', 'Signature invalide', array( 'status' => 403 ) );
 
         $ip_address = $this->get_client_ip();
         delete_transient( 'werocket_rate_limit_' . md5( $ip_address ) );
@@ -291,9 +293,9 @@ class WeRocket_Agent {
     }
 
     // Vérifie une signature Ed25519 détachée avec la clé PUBLIQUE (la clé privée ne quitte
-    // jamais le backend). Message signé : "site_url|timestamp|route" (deux variantes testées
+    // jamais le backend). Message signé : "site_url|timestamp|route[|extra]" (deux variantes testées
     // pour tolérer la présence/absence du slash final sur l'URL du site).
-    private function verify_signature( $provided_signature_hex, $timestamp, $route ) {
+    private function verify_signature( $provided_signature_hex, $timestamp, $route, $extra = '' ) {
         if ( ! ctype_xdigit( $provided_signature_hex ) || strlen( $provided_signature_hex ) !== 128 ) {
             return false; // signature détachée Ed25519 = 64 octets = 128 caractères hex
         }
@@ -302,8 +304,9 @@ class WeRocket_Agent {
         $site_url = get_site_url();
         $site_url_clean = rtrim( $site_url, '/' );
 
-        $message1 = $site_url . '|' . $timestamp . '|' . $route;
-        $message2 = $site_url_clean . '|' . $timestamp . '|' . $route;
+        $suffix   = '' === $extra ? '' : '|' . $extra;
+        $message1 = $site_url . '|' . $timestamp . '|' . $route . $suffix;
+        $message2 = $site_url_clean . '|' . $timestamp . '|' . $route . $suffix;
 
         return sodium_crypto_sign_verify_detached( $signature, $message1, $this->public_key )
             || sodium_crypto_sign_verify_detached( $signature, $message2, $this->public_key );
@@ -604,32 +607,31 @@ class WeRocket_Agent {
 
     // 7. Installation/remplacement de Breakdance depuis un zip officiel hébergé par la plateforme.
     // L'agent télécharge lui-même le zip (évite limites de POST/mémoire PHP). La signature Ed25519
-    // ne couvre que "site_url|timestamp|route", pas les paramètres : l'URL est donc restreinte à
-    // des hôtes explicitement autorisés (WEROCKET_ZIP_ALLOWED_HOSTS dans wp-config, ou option
-    // 'werocket_zip_allowed_hosts'), en HTTPS, et le zip doit correspondre au sha256 fourni et
-    // ne contenir que le plugin breakdance/. L'activation de la licence est un appel séparé
-    // (/activate-license) : dans cette requête, l'ancien code de Breakdance est encore en mémoire.
+    // couvre ici "site_url|timestamp|route|sha256|zip_url" : URL et empreinte ne peuvent pas être
+    // altérées lors d'un rejeu. Le zip doit correspondre au sha256 et ne contenir que breakdance/.
+    // Restriction d'hôte facultative (WEROCKET_ZIP_ALLOWED_HOSTS ou option 'werocket_zip_allowed_hosts').
+    // L'activation de la licence est un appel séparé (/activate-license) : dans cette requête,
+    // l'ancien code de Breakdance est encore en mémoire.
     public function handle_install_plugin_zip_request( WP_REST_Request $request ) {
-        $auth = $this->authenticate_request( $request );
-        if ( is_wp_error( $auth ) ) return $auth;
-
+        // Paramètres lus AVANT l'authentification : ils font partie du message signé.
         $zip_url = $request->get_param( 'zip_url' );
         $sha256  = strtolower( trim( $request->get_param( 'sha256' ) ) );
+
+        $auth = $this->authenticate_request( $request, $sha256 . '|' . $zip_url );
+        if ( is_wp_error( $auth ) ) return $auth;
 
         if ( ! preg_match( '/^[a-f0-9]{64}$/', $sha256 ) ) {
             return new WP_Error( 'sha256_invalid', 'Empreinte sha256 invalide.', array( 'status' => 400 ) );
         }
 
         $parts = wp_parse_url( $zip_url );
-        if ( empty( $parts['scheme'] ) || 'https' !== $parts['scheme'] || empty( $parts['host'] ) ) {
-            return new WP_Error( 'zip_url_invalid', 'URL du zip invalide (HTTPS requis).', array( 'status' => 400 ) );
+        if ( empty( $parts['scheme'] ) || ! in_array( $parts['scheme'], array( 'http', 'https' ), true ) || empty( $parts['host'] ) ) {
+            return new WP_Error( 'zip_url_invalid', 'URL du zip invalide.', array( 'status' => 400 ) );
         }
 
+        // Allowlist facultative : l'URL et le sha256 sont déjà couverts par la signature Ed25519.
         $allowed_hosts = $this->get_allowed_zip_hosts();
-        if ( empty( $allowed_hosts ) ) {
-            return new WP_Error( 'zip_hosts_not_configured', 'Aucun hôte autorisé pour le téléchargement (WEROCKET_ZIP_ALLOWED_HOSTS).', array( 'status' => 403 ) );
-        }
-        if ( ! in_array( strtolower( $parts['host'] ), $allowed_hosts, true ) ) {
+        if ( ! empty( $allowed_hosts ) && ! in_array( strtolower( $parts['host'] ), $allowed_hosts, true ) ) {
             $this->log_event( 'zip_host_not_allowed:' . $parts['host'], $this->get_client_ip() );
             return new WP_Error( 'zip_host_not_allowed', 'Hôte du zip non autorisé.', array( 'status' => 403 ) );
         }
