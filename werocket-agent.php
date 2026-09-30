@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.3.1
+ * Version: 3.4.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -148,6 +148,29 @@ class WeRocket_Agent {
                 'permission_callback' => '__return_true',
                 'args'                => array_merge( $this->get_default_args(), array(
                     'license_key' => array(
+                        'required'          => true,
+                        'type'              => 'string',
+                        'sanitize_callback' => 'sanitize_text_field',
+                    ),
+                )),
+            )
+        );
+
+        // 7. Installation/remplacement de Breakdance depuis un zip officiel (Action)
+        register_rest_route(
+            $this->namespace,
+            '/install-plugin-zip',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_install_plugin_zip_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => array_merge( $this->get_default_args(), array(
+                    'zip_url' => array(
+                        'required'          => true,
+                        'type'              => 'string',
+                        'sanitize_callback' => 'esc_url_raw',
+                    ),
+                    'sha256' => array(
                         'required'          => true,
                         'type'              => 'string',
                         'sanitize_callback' => 'sanitize_text_field',
@@ -567,11 +590,135 @@ class WeRocket_Agent {
 
         $this->log_event( 'breakdance_license_activated', $this->get_client_ip() );
 
+        // changeLicenseKey() ne remonte pas l'échec (clé refusée, quota de sites atteint…) :
+        // on relit le statut réel plutôt que de répondre "revalidée" à l'aveugle.
+        $license = $this->get_breakdance_license_status();
+        $is_ok   = is_array( $license ) && ! empty( $license['valid'] );
+
         return rest_ensure_response( array(
-            'success' => true,
-            'message' => 'Licence Breakdance revalidée',
-            'license' => $this->get_breakdance_license_status(),
+            'success' => $is_ok,
+            'message' => $is_ok ? 'Licence Breakdance revalidée' : 'Clé transmise à Breakdance mais licence non validée (clé refusée ou quota de sites atteint ?)',
+            'license' => $license,
         ));
+    }
+
+    // 7. Installation/remplacement de Breakdance depuis un zip officiel hébergé par la plateforme.
+    // L'agent télécharge lui-même le zip (évite limites de POST/mémoire PHP). La signature Ed25519
+    // ne couvre que "site_url|timestamp|route", pas les paramètres : l'URL est donc restreinte à
+    // des hôtes explicitement autorisés (WEROCKET_ZIP_ALLOWED_HOSTS dans wp-config, ou option
+    // 'werocket_zip_allowed_hosts'), en HTTPS, et le zip doit correspondre au sha256 fourni et
+    // ne contenir que le plugin breakdance/. L'activation de la licence est un appel séparé
+    // (/activate-license) : dans cette requête, l'ancien code de Breakdance est encore en mémoire.
+    public function handle_install_plugin_zip_request( WP_REST_Request $request ) {
+        $auth = $this->authenticate_request( $request );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        $zip_url = $request->get_param( 'zip_url' );
+        $sha256  = strtolower( trim( $request->get_param( 'sha256' ) ) );
+
+        if ( ! preg_match( '/^[a-f0-9]{64}$/', $sha256 ) ) {
+            return new WP_Error( 'sha256_invalid', 'Empreinte sha256 invalide.', array( 'status' => 400 ) );
+        }
+
+        $parts = wp_parse_url( $zip_url );
+        if ( empty( $parts['scheme'] ) || 'https' !== $parts['scheme'] || empty( $parts['host'] ) ) {
+            return new WP_Error( 'zip_url_invalid', 'URL du zip invalide (HTTPS requis).', array( 'status' => 400 ) );
+        }
+
+        $allowed_hosts = $this->get_allowed_zip_hosts();
+        if ( empty( $allowed_hosts ) ) {
+            return new WP_Error( 'zip_hosts_not_configured', 'Aucun hôte autorisé pour le téléchargement (WEROCKET_ZIP_ALLOWED_HOSTS).', array( 'status' => 403 ) );
+        }
+        if ( ! in_array( strtolower( $parts['host'] ), $allowed_hosts, true ) ) {
+            $this->log_event( 'zip_host_not_allowed:' . $parts['host'], $this->get_client_ip() );
+            return new WP_Error( 'zip_host_not_allowed', 'Hôte du zip non autorisé.', array( 'status' => 403 ) );
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/misc.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        require_once ABSPATH . 'wp-admin/includes/class-automatic-upgrader-skin.php';
+
+        WP_Filesystem();
+        @set_time_limit( 300 );
+
+        $tmp = download_url( $zip_url, 300 );
+        if ( is_wp_error( $tmp ) ) {
+            return new WP_Error( 'zip_download_failed', $tmp->get_error_message(), array( 'status' => 502 ) );
+        }
+
+        if ( ! hash_equals( $sha256, hash_file( 'sha256', $tmp ) ) ) {
+            @unlink( $tmp );
+            return new WP_Error( 'zip_hash_mismatch', 'Empreinte du zip incorrecte.', array( 'status' => 400 ) );
+        }
+
+        // Le zip doit contenir uniquement le dossier breakdance/, avec son fichier principal.
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            @unlink( $tmp );
+            return new WP_Error( 'zip_unsupported', 'Extension PHP zip manquante.', array( 'status' => 500 ) );
+        }
+        $zip = new ZipArchive();
+        if ( true !== $zip->open( $tmp ) ) {
+            @unlink( $tmp );
+            return new WP_Error( 'zip_invalid', 'Archive zip illisible.', array( 'status' => 400 ) );
+        }
+        $has_main = false;
+        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+            $name = $zip->getNameIndex( $i );
+            if ( 0 !== strpos( $name, 'breakdance/' ) || false !== strpos( $name, '..' ) ) {
+                $zip->close();
+                @unlink( $tmp );
+                return new WP_Error( 'zip_wrong_plugin', 'Le zip ne contient pas uniquement le plugin breakdance/.', array( 'status' => 400 ) );
+            }
+            if ( 'breakdance/plugin.php' === $name ) $has_main = true;
+        }
+        $zip->close();
+        if ( ! $has_main ) {
+            @unlink( $tmp );
+            return new WP_Error( 'zip_wrong_plugin', 'breakdance/plugin.php absent du zip.', array( 'status' => 400 ) );
+        }
+
+        $plugin_path = 'breakdance/plugin.php';
+        $was_active  = is_plugin_active( $plugin_path );
+        $old_version = $this->get_breakdance_plugin_version();
+
+        $upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+        $result   = $upgrader->install( $tmp, array( 'overwrite_package' => true ) );
+        @unlink( $tmp );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_Error( 'install_failed', $result->get_error_message(), array( 'status' => 500 ) );
+        }
+        if ( ! $result ) {
+            $skin_errors = $upgrader->skin->get_errors();
+            $message = is_wp_error( $skin_errors ) && $skin_errors->has_errors() ? $skin_errors->get_error_message() : 'L\'installation a échoué.';
+            return new WP_Error( 'install_failed', $message, array( 'status' => 500 ) );
+        }
+
+        wp_clean_plugins_cache( true );
+        if ( ! is_plugin_active( $plugin_path ) ) {
+            $activated = activate_plugin( $plugin_path );
+            if ( is_wp_error( $activated ) ) {
+                return new WP_Error( 'activation_failed', $activated->get_error_message(), array( 'status' => 500 ) );
+            }
+        }
+
+        $this->log_event( 'plugin_zip_installed:breakdance', $this->get_client_ip() );
+
+        return rest_ensure_response( array(
+            'success'     => true,
+            'message'     => 'Breakdance installé depuis le zip',
+            'was_active'  => $was_active,
+            'old_version' => $old_version,
+            'new_version' => $this->get_breakdance_plugin_version(),
+        ));
+    }
+
+    private function get_allowed_zip_hosts() {
+        $raw = defined( 'WEROCKET_ZIP_ALLOWED_HOSTS' ) ? WEROCKET_ZIP_ALLOWED_HOSTS : get_option( 'werocket_zip_allowed_hosts', '' );
+        if ( empty( $raw ) ) return array();
+        return array_filter( array_map( 'strtolower', array_map( 'trim', explode( ',', $raw ) ) ) );
     }
 
     // --- DATA GETTERS ---
