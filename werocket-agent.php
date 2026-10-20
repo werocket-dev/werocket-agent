@@ -5,7 +5,7 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
  * Plugin Name: WeRocket Agent
  * Plugin URI: https://werocket.com
  * Description: Agent sécurisé pour l'audit de maintenance et les mises à jour à distance ! Authentification par signature Ed25519 (clé publique) — plus de secret partagé.
- * Version: 3.5.0
+ * Version: 3.6.0
  * Author: Romain
  * License: GPL v2 or later
  */
@@ -156,7 +156,7 @@ class WeRocket_Agent {
             )
         );
 
-        // 7. Installation/remplacement de Breakdance depuis un zip officiel (Action)
+        // 7. Installation/mise à jour d'un plugin quelconque depuis un zip (Action)
         register_rest_route(
             $this->namespace,
             '/install-plugin-zip',
@@ -175,6 +175,24 @@ class WeRocket_Agent {
                         'required'          => true,
                         'type'              => 'string',
                         'sanitize_callback' => 'sanitize_text_field',
+                    ),
+                )),
+            )
+        );
+
+        // 8. Suppression d'un plugin (Action)
+        register_rest_route(
+            $this->namespace,
+            '/delete-plugin',
+            array(
+                'methods'             => 'POST',
+                'callback'            => array( $this, 'handle_delete_plugin_request' ),
+                'permission_callback' => '__return_true',
+                'args'                => array_merge( $this->get_default_args(), array(
+                    // Pas de sanitize_callback : la valeur est signée telle quelle par le backend.
+                    'plugin_path' => array(
+                        'required' => true,
+                        'type'     => 'string',
                     ),
                 )),
             )
@@ -553,6 +571,56 @@ class WeRocket_Agent {
         ));
     }
 
+    // 8. Suppression d'un plugin (désactivation puis suppression des fichiers)
+    public function handle_delete_plugin_request( WP_REST_Request $request ) {
+        // Lu AVANT l'authentification : fait partie du message signé.
+        $plugin_path = (string) $request->get_param( 'plugin_path' ); // ex: "akismet/akismet.php"
+
+        $auth = $this->authenticate_request( $request, $plugin_path );
+        if ( is_wp_error( $auth ) ) return $auth;
+
+        // Validation stricte du format : dossier/fichier.php, sans traversal
+        if ( ! preg_match( '#^[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.php$#', $plugin_path ) ) {
+            return new WP_Error( 'plugin_path_invalid', 'Chemin de plugin invalide.', array( 'status' => 400 ) );
+        }
+
+        // Garde-fou : l'agent ne peut pas se supprimer lui-même
+        if ( $plugin_path === plugin_basename( __FILE__ ) ) {
+            return new WP_Error( 'plugin_self', 'Impossible de supprimer l\'agent WeRocket lui-même.', array( 'status' => 400 ) );
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+        if ( ! file_exists( WP_PLUGIN_DIR . '/' . $plugin_path ) ) {
+            return new WP_Error( 'plugin_not_found', 'Le plugin spécifié est introuvable.', array( 'status' => 404 ) );
+        }
+
+        WP_Filesystem();
+
+        if ( is_plugin_active( $plugin_path ) ) {
+            deactivate_plugins( $plugin_path, true );
+        }
+
+        $result = delete_plugins( array( $plugin_path ) );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_Error( 'delete_failed', $result->get_error_message(), array( 'status' => 500 ) );
+        }
+        if ( true !== $result ) {
+            return new WP_Error( 'delete_failed', 'La suppression du plugin a échoué.', array( 'status' => 500 ) );
+        }
+
+        delete_site_transient( 'update_plugins' );
+        $this->log_event( 'plugin_deleted:' . $plugin_path, $this->get_client_ip() );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'message' => 'Plugin supprimé',
+            'plugin'  => $plugin_path,
+        ));
+    }
+
     // 6. Activation/revalidation d'une licence Breakdance
     // Appelle directement Breakdance\...\LicenseKeyManager::changeLicenseKey(), la même
     // méthode publique utilisée par leur propre commande WP-CLI (`wp breakdance license`).
@@ -655,7 +723,8 @@ class WeRocket_Agent {
             return new WP_Error( 'zip_hash_mismatch', 'Empreinte du zip incorrecte.', array( 'status' => 400 ) );
         }
 
-        // Le zip doit contenir uniquement le dossier breakdance/, avec son fichier principal.
+        // Le zip doit contenir un seul dossier racine (le plugin), sans traversal, avec un
+        // fichier PHP principal portant un en-tête "Plugin Name".
         if ( ! class_exists( 'ZipArchive' ) ) {
             @unlink( $tmp );
             return new WP_Error( 'zip_unsupported', 'Extension PHP zip manquante.', array( 'status' => 500 ) );
@@ -665,25 +734,55 @@ class WeRocket_Agent {
             @unlink( $tmp );
             return new WP_Error( 'zip_invalid', 'Archive zip illisible.', array( 'status' => 400 ) );
         }
-        $has_main = false;
+        $root_dir    = null;
+        $has_main    = false;
+        $zip_failure = null;
         for ( $i = 0; $i < $zip->numFiles; $i++ ) {
             $name = $zip->getNameIndex( $i );
-            if ( 0 !== strpos( $name, 'breakdance/' ) || false !== strpos( $name, '..' ) ) {
-                $zip->close();
-                @unlink( $tmp );
-                return new WP_Error( 'zip_wrong_plugin', 'Le zip ne contient pas uniquement le plugin breakdance/.', array( 'status' => 400 ) );
+            if ( false !== strpos( $name, '..' ) || '/' === substr( $name, 0, 1 ) || false !== strpos( $name, '\\' ) ) {
+                $zip_failure = 'Chemin interdit dans le zip.';
+                break;
             }
-            if ( 'breakdance/plugin.php' === $name ) $has_main = true;
+            // __MACOSX/ est ajouté par le Finder de macOS, il est ignoré
+            if ( 0 === strpos( $name, '__MACOSX/' ) ) continue;
+
+            $parts = explode( '/', $name, 2 );
+            if ( ! isset( $parts[1] ) || ! preg_match( '#^[a-zA-Z0-9_\-]+$#', $parts[0] ) ) {
+                $zip_failure = 'Le zip doit contenir un seul dossier racine (le plugin).';
+                break;
+            }
+            if ( null === $root_dir ) $root_dir = $parts[0];
+            if ( $parts[0] !== $root_dir ) {
+                $zip_failure = 'Le zip doit contenir un seul dossier racine (le plugin).';
+                break;
+            }
+            // Fichier PHP principal : directement dans le dossier racine, avec un en-tête Plugin Name
+            if ( ! $has_main && preg_match( '#^[a-zA-Z0-9_\-]+\.php$#', $parts[1] ) ) {
+                $head = $zip->getFromIndex( $i, 8192 );
+                if ( false !== $head && preg_match( '/^[ \t\/*#@]*Plugin Name:/mi', $head ) ) $has_main = true;
+            }
         }
         $zip->close();
-        if ( ! $has_main ) {
+        if ( null === $zip_failure && ( null === $root_dir || ! $has_main ) ) {
+            $zip_failure = 'Aucun plugin WordPress valide dans le zip (en-tête "Plugin Name" introuvable).';
+        }
+        if ( null !== $zip_failure ) {
             @unlink( $tmp );
-            return new WP_Error( 'zip_wrong_plugin', 'breakdance/plugin.php absent du zip.', array( 'status' => 400 ) );
+            return new WP_Error( 'zip_invalid_plugin', $zip_failure, array( 'status' => 400 ) );
         }
 
-        $plugin_path = 'breakdance/plugin.php';
-        $was_active  = is_plugin_active( $plugin_path );
-        $old_version = $this->get_breakdance_plugin_version();
+        // Plugin déjà présent ? (pour distinguer installation / mise à jour)
+        wp_clean_plugins_cache( false );
+        $old_path    = null;
+        $old_version = null;
+        foreach ( get_plugins() as $path => $info ) {
+            if ( 0 === strpos( $path, $root_dir . '/' ) ) {
+                $old_path    = $path;
+                $old_version = $info['Version'];
+                break;
+            }
+        }
+        $was_active = null !== $old_path && is_plugin_active( $old_path );
 
         $upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
         $result   = $upgrader->install( $tmp, array( 'overwrite_package' => true ) );
@@ -699,21 +798,31 @@ class WeRocket_Agent {
         }
 
         wp_clean_plugins_cache( true );
-        if ( ! is_plugin_active( $plugin_path ) ) {
+        $plugin_path = $upgrader->plugin_info();
+        if ( empty( $plugin_path ) ) {
+            return new WP_Error( 'install_failed', 'Plugin installé mais fichier principal introuvable.', array( 'status' => 500 ) );
+        }
+
+        // Mise à jour : on conserve l'état d'activation d'avant. Nouvelle installation : activation.
+        if ( ! is_plugin_active( $plugin_path ) && ( null === $old_path || $was_active ) ) {
             $activated = activate_plugin( $plugin_path );
             if ( is_wp_error( $activated ) ) {
                 return new WP_Error( 'activation_failed', $activated->get_error_message(), array( 'status' => 500 ) );
             }
         }
 
-        $this->log_event( 'plugin_zip_installed:breakdance', $this->get_client_ip() );
+        $plugins = get_plugins();
+        $this->log_event( 'plugin_zip_installed:' . $plugin_path, $this->get_client_ip() );
 
         return rest_ensure_response( array(
             'success'     => true,
-            'message'     => 'Breakdance installé depuis le zip',
+            'message'     => null === $old_path ? 'Plugin installé depuis le zip' : 'Plugin mis à jour depuis le zip',
+            'plugin'      => $plugin_path,
+            'installed'   => null === $old_path,
             'was_active'  => $was_active,
+            'is_active'   => is_plugin_active( $plugin_path ),
             'old_version' => $old_version,
-            'new_version' => $this->get_breakdance_plugin_version(),
+            'new_version' => isset( $plugins[ $plugin_path ] ) ? $plugins[ $plugin_path ]['Version'] : null,
         ));
     }
 
